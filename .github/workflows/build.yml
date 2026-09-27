@@ -1,0 +1,159 @@
+name: build-exact-ninfer-slim
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  SOURCE_REPO: tensorninja/ninfer-4090
+  SOURCE_SHA: c55dcf359730c0d2e6c310f670966c25cf67870b
+  IMAGE_TAG: ninfer-4090:sm89
+  RELEASE_TAG: ninfer-c55dcf-slim-recovery-v1
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Check out recovery builder
+        uses: actions/checkout@v4
+
+      - name: Free bounded runner space safely
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo python3 - <<'PY'
+          from pathlib import Path
+          import shutil
+
+          allowed = (
+              "/usr/local/lib/android",
+              "/usr/share/dotnet",
+              "/opt/ghc",
+              "/usr/local/.ghcup",
+              "/opt/hostedtoolcache/CodeQL",
+          )
+          for literal in allowed:
+              path = Path(literal)
+              if not path.exists():
+                  print(f"SAFE_REMOVE_SKIP {literal}")
+                  continue
+              resolved = path.resolve(strict=True)
+              if str(resolved) != literal or resolved == Path("/") or len(resolved.parts) < 3:
+                  raise SystemExit(f"refusing unsafe runner cleanup target: {literal} -> {resolved}")
+              print(f"SAFE_REMOVE_TREE {resolved}")
+              shutil.rmtree(resolved)
+          PY
+          docker system prune --all --force --volumes
+          sudo apt-get clean
+          df -h /
+
+      - name: Check out exact public NInfer source
+        uses: actions/checkout@v4
+        with:
+          repository: tensorninja/ninfer-4090
+          ref: c55dcf359730c0d2e6c310f670966c25cf67870b
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify source and no model bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git -C source rev-parse HEAD)"
+          test "$actual" = "$SOURCE_SHA"
+          test ! -f source/models/qwen3_8_27b.ninfer
+          printf 'SOURCE_SHA=%s\n' "$actual"
+          du -sh source
+          free -h
+          df -h /
+
+      - name: Build exact slim CUDA 13.2 runtime
+        shell: bash
+        env:
+          BUILDKIT_PROGRESS: plain
+        run: |
+          set -euo pipefail
+          docker build \
+            --progress plain \
+            --file Dockerfile.slim \
+            --tag "$IMAGE_TAG" \
+            source 2>&1 | tee hosted-build.log
+
+      - name: Verify built image contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          revision="$(docker image inspect "$IMAGE_TAG" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')"
+          test "$revision" = "$SOURCE_SHA"
+          docker run --rm --entrypoint /bin/sh "$IMAGE_TAG" -lc '
+            set -eu
+            test ! -e /opt/ninfer/models/qwen3_8_27b.ninfer
+            test -x /usr/local/bin/ninfer
+            test -x /usr/local/bin/ninfer-serve
+            test -f /opt/ninfer/web/index.html
+            command -v ninfer
+            command -v ninfer-serve
+            echo SLIM_IMAGE_CONTRACT_PASS
+          '
+          docker image inspect "$IMAGE_TAG" > image-inspect.json
+          docker history --no-trunc "$IMAGE_TAG" > image-history.txt
+          docker image inspect "$IMAGE_TAG" --format 'IMAGE_ID={{.Id}} SIZE={{.Size}} REVISION={{index .Config.Labels "org.opencontainers.image.revision"}}'
+
+      - name: Package split Docker archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v zstd >/dev/null || { sudo apt-get update; sudo apt-get install -y zstd; }
+          mkdir -p release
+          docker save "$IMAGE_TAG" | zstd -T0 -10 -o release/ninfer-sm89-c55dcf.tar.zst
+          sha256sum release/ninfer-sm89-c55dcf.tar.zst > release/ARCHIVE_SHA256SUMS.txt
+          split -b 1500M -d -a 2 \
+            release/ninfer-sm89-c55dcf.tar.zst \
+            release/ninfer-sm89-c55dcf.tar.zst.part-
+          rm -f -- release/ninfer-sm89-c55dcf.tar.zst
+          cp image-inspect.json image-history.txt hosted-build.log release/
+          {
+            echo '# Exact NInfer slim recovery build'
+            echo
+            echo "- Source repository: $SOURCE_REPO"
+            echo "- Source commit: $SOURCE_SHA"
+            echo "- Image tag: $IMAGE_TAG"
+            echo "- Runner: $RUNNER_NAME / $RUNNER_OS / $RUNNER_ARCH"
+            echo "- No model weights were present in the checkout or image."
+            echo "- Docker archive is split into 1,500 MiB numbered parts."
+            echo
+            docker image inspect "$IMAGE_TAG" --format '- Image ID: `{{.Id}}`'
+            docker image inspect "$IMAGE_TAG" --format '- Logical size: `{{.Size}}` bytes'
+            echo
+            echo 'Reassemble with:'
+            echo '```bash'
+            echo 'cat ninfer-sm89-c55dcf.tar.zst.part-* > ninfer-sm89-c55dcf.tar.zst'
+            echo 'zstd -dc ninfer-sm89-c55dcf.tar.zst | docker load'
+            echo '```'
+          } > release/BUILD_RECEIPT.md
+          sha256sum release/ninfer-sm89-c55dcf.tar.zst.part-* > release/PART_SHA256SUMS.txt
+          ls -lh release
+
+      - name: Publish public recovery release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release already exists: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" \
+            release/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Exact NInfer c55dcf slim recovery image" \
+            --notes-file release/BUILD_RECEIPT.md
